@@ -3,7 +3,6 @@
 #include <pthread.h>
 #include <string.h>
 #include <malloc.h>
-#include <err.h>
 #include <assert.h>
 #include "HashMap.h"
 #include "path_utils.h"
@@ -73,7 +72,7 @@ void get_read_access(Node *node) {
         syserr("lock failed");
 
     node->readers_waiting++;
-    while (node->readers_waiting + node->modifiers_waiting > 0 && node->change <= 0) {
+    while (node->readers_waiting + node->modifiers_waiting > 1 && node->change <= 0) {
         if ((err = pthread_cond_wait(&node->read_cond, &node->mutex)) != 0)
             syserr("read cond wait failed");
     }
@@ -105,7 +104,7 @@ void give_up_read_access(Node *node) {
         syserr("unlock failed");
 }
 
-Node *traverse_down(Tree *tree, Node *node, const char *component) {
+Node *traverse_down(Node *node, const char *component) {
     Node *new_node = NULL;
     get_read_access(node);
 
@@ -122,7 +121,7 @@ void get_modify_access(Node *node) {
         syserr("lock failed");
 
     node->modifiers_waiting++;
-    while (node->modifiers_count + node->readers_count > 0 && node->change != MODIFIER_ACCESS) {
+    while (node->modifiers_count + node->readers_count > 1 && node->change != MODIFIER_ACCESS) {
         if ((err = pthread_cond_wait(&node->modify_cond, &node->mutex)) != 0)
             syserr("modify cond wait failed");
     }
@@ -163,7 +162,8 @@ int tree_remove(Tree *tree, const char *path) {
 
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     char last_component[MAX_FOLDER_NAME_LENGTH + 1];
-    const char *subpath = make_path_to_parent(path, last_component);
+    char *initial_subpath = make_path_to_parent(path, last_component);
+    const char *subpath = initial_subpath;
 
     if (!subpath) // tried to remove the root
         return EBUSY;
@@ -171,9 +171,10 @@ int tree_remove(Tree *tree, const char *path) {
     Node *node = tree->root;
 
     while ((subpath = split_path(subpath, component)) && node) {
-        node = traverse_down(tree, node, component);
+        node = traverse_down(node, component);
     }
 
+    free(initial_subpath); //todo: trzeba jakoś zwolnić w przypadku błędów pthreads
     if (!node)
         return ENOENT;
 
@@ -203,7 +204,8 @@ int tree_create(Tree* tree, const char* path) {
 
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     char last_component[MAX_FOLDER_NAME_LENGTH + 1];
-    const char *subpath = make_path_to_parent(path, last_component);
+    char *initial_subpath = make_path_to_parent(path, last_component);
+    const char *subpath = initial_subpath;
 
     if (!subpath)
         return EEXIST;
@@ -211,8 +213,10 @@ int tree_create(Tree* tree, const char* path) {
     Node *node = tree->root;
 
     while ((subpath = split_path(subpath, component)) && node) {
-        node = traverse_down(tree, node, component);
+        node = traverse_down(node, component);
     }
+
+    free(initial_subpath); //todo: trzeba jakoś zwolnić w przypadku błędów pthreads
 
     if (!node)
         return ENOENT;
@@ -231,4 +235,27 @@ int tree_create(Tree* tree, const char* path) {
 
     give_up_modify_access(node);
     return 0;
+}
+
+void remove_nodes(Node *node){
+    HashMapIterator hm = hmap_iterator(node->children);
+    const char *key;
+    void *value;
+    while (hmap_next(node->children, &hm, &key, &value)) {
+        remove_nodes((Node *) value);
+    }
+
+    delete_node(node);
+}
+
+void tree_free(Tree *tree){
+    remove_nodes(tree->root);
+    free(tree);
+}
+
+
+Tree* tree_new() {
+    Tree *tree = (Tree *) malloc(sizeof(Tree));
+    tree->root = new_node();
+    return tree;
 }
