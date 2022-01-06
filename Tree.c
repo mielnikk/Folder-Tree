@@ -36,8 +36,35 @@ struct Tree {
 
 
 void delete_node(Node *node) {
+    if (pthread_mutex_destroy(&node->mutex) != 0)
+        syserr("mutex destroy failed");
+    if (pthread_cond_destroy(&node->read_cond) != 0)
+        syserr("read cond destroy failed");
+    if (pthread_cond_destroy(&node->modify_cond) != 0)
+        syserr("modify cond destroy failed");
+
     hmap_free(node->children);
     free(node);
+}
+
+Node *new_node(){
+    Node *node = (Node *) malloc(sizeof(Node));
+
+    if (pthread_mutex_init(&node->mutex, 0) != 0)
+        syserr("mutex init failed");
+    if (pthread_cond_init(&node->read_cond, 0) != 0)
+        syserr("read cond init failed");
+    if (pthread_cond_init(&node->modify_cond, 0) != 0)
+        syserr("modify cond init failed");
+
+    node->change = 0;
+    node->modifiers_waiting = 0;
+    node->readers_waiting = 0;
+    node->modifiers_count = 0;
+    node->readers_count = 0;
+    node->children = hmap_new();
+
+    return node;
 }
 
 void get_read_access(Node *node) {
@@ -167,5 +194,41 @@ int tree_remove(Tree *tree, const char *path) {
     assert(hmap_remove(node->children, last_component));
     delete_node(child);
     give_up_modify_access(node); // todo: chyba trzeba zaczekać, aż procesy w dziecku się skończą
+    return 0;
+}
+
+int tree_create(Tree* tree, const char* path) {
+    if (!is_path_valid(path))
+        return EINVAL;
+
+    char component[MAX_FOLDER_NAME_LENGTH + 1];
+    char last_component[MAX_FOLDER_NAME_LENGTH + 1];
+    const char *subpath = make_path_to_parent(path, last_component);
+
+    if (!subpath)
+        return EEXIST;
+
+    Node *node = tree->root;
+
+    while ((subpath = split_path(subpath, component)) && node) {
+        node = traverse_down(tree, node, component);
+    }
+
+    if (!node)
+        return ENOENT;
+
+    get_modify_access(node);
+
+    Node *child = (Node *) hmap_get(node->children, last_component);
+
+    if (child){
+        give_up_modify_access(node);
+        return EEXIST;
+    }
+
+    Node *new_folder = new_node();
+    hmap_insert(node->children, last_component, new_folder);
+
+    give_up_modify_access(node);
     return 0;
 }
