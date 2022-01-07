@@ -46,7 +46,7 @@ void delete_node(Node *node) {
     free(node);
 }
 
-Node *new_node(){
+Node *new_node() {
     Node *node = (Node *) malloc(sizeof(Node));
 
     if (pthread_mutex_init(&node->mutex, 0) != 0)
@@ -87,7 +87,7 @@ void get_read_access(Node *node) {
         if ((err = pthread_cond_signal(&node->read_cond)) != 0)
             syserr("read cond signal failed");
 
-    if((err = pthread_mutex_unlock(&node->mutex)) != 0)
+    if ((err = pthread_mutex_unlock(&node->mutex)) != 0)
         syserr("unlock failed");
 }
 
@@ -96,7 +96,7 @@ void give_up_read_access(Node *node) {
     node->readers_count--;
     if (node->readers_count == 0 && node->modifiers_waiting > 0) {
         node->change = MODIFIER_ACCESS;
-        if((err = pthread_cond_signal(&node->modify_cond)) != 0)
+        if ((err = pthread_cond_signal(&node->modify_cond)) != 0)
             syserr("modify cond wait failed");
     }
 
@@ -182,7 +182,7 @@ int tree_remove(Tree *tree, const char *path) {
 
     Node *child = (Node *) hmap_get(node->children, last_component);
 
-    if (!child){
+    if (!child) {
         give_up_modify_access(node);
         return ENOENT;
     }
@@ -198,7 +198,7 @@ int tree_remove(Tree *tree, const char *path) {
     return 0;
 }
 
-int tree_create(Tree* tree, const char* path) {
+int tree_create(Tree *tree, const char *path) {
     if (!is_path_valid(path))
         return EINVAL;
 
@@ -225,7 +225,7 @@ int tree_create(Tree* tree, const char* path) {
 
     Node *child = (Node *) hmap_get(node->children, last_component);
 
-    if (child){
+    if (child) {
         give_up_modify_access(node);
         return EEXIST;
     }
@@ -237,7 +237,7 @@ int tree_create(Tree* tree, const char* path) {
     return 0;
 }
 
-void remove_nodes(Node *node){
+void remove_nodes(Node *node) {
     HashMapIterator hm = hmap_iterator(node->children);
     const char *key;
     void *value;
@@ -248,14 +248,72 @@ void remove_nodes(Node *node){
     delete_node(node);
 }
 
-void tree_free(Tree *tree){
+void tree_free(Tree *tree) {
     remove_nodes(tree->root);
     free(tree);
 }
 
 
-Tree* tree_new() {
+Tree *tree_new() {
     Tree *tree = (Tree *) malloc(sizeof(Tree));
     tree->root = new_node();
     return tree;
+}
+
+// Creates a string consisting of comma-separated subfolders.
+// The calling thread shall have read access to the node's hashmap.
+char *list_subfolders(Node *node) {
+    size_t string_length = 0;
+    size_t buffer_length = 1;
+    char *string = (char *) malloc(sizeof(char));
+
+    HashMapIterator it = hmap_iterator(node->children);
+    const char *key;
+    void *value;
+
+    while (hmap_next(node->children, &it, &key, &value)) {
+        size_t key_length = strlen(key);
+        if (string_length + key_length + 1 > buffer_length) {
+            buffer_length += MAX_FOLDER_NAME_LENGTH + 1;
+            string = (char *) realloc(string, buffer_length * sizeof(char));
+        }
+
+        if (string_length > 0)
+            string[string_length++] = ',';
+
+        strcpy(string + string_length, key);
+        string_length += key_length;
+    }
+
+    string[string_length] = '\0';
+    return string;
+}
+
+char *tree_list(Tree *tree, const char *path) {
+    if (!is_path_valid(path))
+        return NULL;
+
+    char component[MAX_FOLDER_NAME_LENGTH + 1];
+    const char *subpath = path;
+    Node *node = tree->root;
+    Node * new_node;
+
+    get_read_access(node);
+
+    while (node && (subpath = split_path(subpath, component))) {
+        new_node = (Node *) hmap_get(node->children, component);
+        if (new_node)
+            get_read_access(new_node);
+        give_up_read_access(node);
+        node = new_node;
+    }
+
+    if (!node) {
+        return NULL;
+    }
+    
+    char *string = list_subfolders(node);
+    give_up_read_access(node);
+
+    return string;
 }
