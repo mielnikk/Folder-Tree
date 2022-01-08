@@ -9,6 +9,7 @@
 #include "err.h"
 
 #define MODIFIER_ACCESS -1
+#define MOVE_ACCESS -2
 
 typedef struct Node Node;
 
@@ -23,6 +24,7 @@ struct Node {
 
     int modifiers_waiting;
     int readers_waiting;
+    int moves_waiting;
 
     int change;
 
@@ -36,8 +38,11 @@ struct Tree {
 
 
 void delete_node(Node *node) {
-    if (pthread_mutex_destroy(&node->mutex) != 0)
-        syserr("mutex destroy failed");
+    int e;
+    if ((e = pthread_mutex_destroy(&node->mutex)) != 0) {
+        printf("%d\n", e);
+        syserr("");
+    }
     if (pthread_cond_destroy(&node->read_cond) != 0)
         syserr("read cond destroy failed");
     if (pthread_cond_destroy(&node->modify_cond) != 0)
@@ -56,6 +61,8 @@ Node *new_node() {
         syserr("read cond init failed");
     if (pthread_cond_init(&node->modify_cond, 0) != 0)
         syserr("modify cond init failed");
+    if (pthread_cond_init(&node->move_cond, 0) != 0)
+        syserr("move cond init failed");
 
     node->change = 0;
     node->modifiers_waiting = 0;
@@ -96,19 +103,21 @@ void get_read_access(Node *node) {
 }
 
 void give_up_read_access(Node *node) {
-    int err;
+    if (pthread_mutex_lock(&node->mutex) != 0)
+        syserr("mutex lock failed");
+
     node->readers_count--;
     if (node->readers_count == 0 && node->modifiers_waiting > 0) {
         node->change = MODIFIER_ACCESS;
-        if ((err = pthread_cond_signal(&node->modify_cond)) != 0)
+        if (pthread_cond_signal(&node->modify_cond) != 0)
             syserr("modify cond wait failed");
     }
-    else if (node->readers_count == 0 && node->modifiers_waiting == 0){
-        if ((err = pthread_cond_signal(&node->move_cond)) != 0)
+    else if (node->readers_count == 0 && node->modifiers_waiting == 0) {
+        if (pthread_cond_signal(&node->move_cond) != 0)
             syserr("move cond wait failed");
     }
 
-    if ((err = pthread_mutex_unlock(&node->mutex)) != 0)
+    if (pthread_mutex_unlock(&node->mutex) != 0)
         syserr("unlock failed");
 }
 
@@ -161,21 +170,40 @@ void give_up_modify_access(Node *node) {
 }
 
 void get_move_access(Node *node) {
-    int err;
-    if ((err = pthread_mutex_lock(&node->mutex)) != 0)
+    if (pthread_mutex_lock(&node->mutex) != 0)
         syserr("lock failed");
 
     while (node->modifiers_waiting + node->modifiers_count
-        + node->readers_waiting + node->readers_count > 0) {
-        if ((err = pthread_cond_wait(&node->move_cond, &node->mutex)) != 0)
+           + node->readers_waiting + node->readers_count > 0) {
+        if (pthread_cond_wait(&node->move_cond, &node->mutex) != 0)
             syserr("modify cond wait failed");
     }
+    node->change = MODIFIER_ACCESS;
 
-    if ((err = pthread_mutex_unlock(&node->mutex)) != 0)
+    if (pthread_mutex_unlock(&node->mutex) != 0)
+        syserr("unlock failed");
+}
+
+void give_up_move_access(Node *node) {
+    if (node->readers_waiting > 0) {
+        node->change = node->readers_waiting;
+        if (pthread_cond_signal(&node->read_cond) != 0)
+            syserr("read cond signal failed");
+    }
+    else if (node->modifiers_waiting > 0) {
+        node->change = MODIFIER_ACCESS;
+        if (pthread_cond_signal(&node->modify_cond) != 0)
+            syserr("modify cond signal failed");
+    }
+
+    if (pthread_mutex_unlock(&node->mutex) != 0)
         syserr("unlock failed");
 }
 
 Node *modify_child(Node *node, const char *path, const bool root_access) {
+    if (!node)
+        return NULL;
+
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     Node *root = node;
     const char *subpath = path;
@@ -213,7 +241,6 @@ int tree_remove(Tree *tree, const char *path) {
     if (!is_path_valid(path))
         return EINVAL;
 
-    char component[MAX_FOLDER_NAME_LENGTH + 1];
     char last_component[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath = make_path_to_parent(path, last_component);
     const char *subpath = initial_subpath;
@@ -376,16 +403,6 @@ bool is_subfolder(const char *a, const char *b) {
         return false;
 }
 
-int check_target(const Node *node, const char *folder_name) {
-    if (!node)
-        return ENOENT;
-
-    if (hmap_get(node->children, folder_name))
-        return EEXIST;
-
-    return 0;
-}
-
 // Ensures there are no running processes in tree rooted in node.
 void bfs(Node *node) {
     get_move_access(node);
@@ -397,10 +414,20 @@ void bfs(Node *node) {
     }
 }
 
-int path_lca(const char *path_a, const char *path_b, char **path) {
-    int last_dash_index = 0;
-    int index = 0;
-    while ((path_a + index) && (path_b + index)) {
+//void unblock_subtree(Node *node){
+//    HashMapIterator it = hmap_iterator(node->children);
+//    const char *key;
+//    void *value;
+//    while (hmap_next(node->children, &it, &key, &value)) {
+//        unblock_subtree((Node *) value);
+//    }
+//    give_up_move_access(node);
+//}
+
+size_t path_lca(const char *path_a, const char *path_b, char **path) {
+    size_t last_dash_index = 0;
+    size_t index = 0;
+    while ((path_a + index)[0] != '\0' && (path_b + index)[0] != '\0') {
         if (path_a[index] != path_b[index])
             break;
         if (path_a[index] == '/')
@@ -414,67 +441,88 @@ int path_lca(const char *path_a, const char *path_b, char **path) {
     return last_dash_index + 1;
 }
 
-int tree_move(Tree* tree, const char* source, const char* target) {
+int tree_move(Tree *tree, const char *source, const char *target) {
     if (!is_path_valid(source) || !is_path_valid(target))
         return EINVAL;
 
+    if (strcmp(source, "/") == 0)
+        return EBUSY;
+
     if (is_subfolder(source, target)) //todo
-        return 69;
+        return -1;
 
     char *common_path;
-    int common_length = path_lca(source, target, &common_path);
-    Node* lca = modify_child(tree->root, common_path, false);
+    size_t common_length = path_lca(source, target, &common_path);
+    Node *lca = modify_child(tree->root, common_path, false);
     // teraz żaden nowy move nie wejdzie nam do wierzchołka
     free(common_path);
+    if (!lca)
+        return ENOENT;
 
     char new_name[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath_target = make_path_to_parent(target + common_length - 1, new_name);
     const char *target_subpath = initial_subpath_target;
 
-    Node *target_parent = modify_child(lca, target_subpath, true);
+    if (!initial_subpath_target) { // target is the lca
+        give_up_modify_access(lca);
+        return EEXIST;
+    }
 
-    int error;
-    if ((error = check_target(target_parent, new_name)) != 0) {
-        free(initial_subpath_target);
-        if (error == EEXIST)
-            give_up_read_access(target_parent);
-        return error;
+    Node *target_parent = modify_child(lca, target_subpath, true);
+    free(initial_subpath_target);
+
+    if (!target_parent) { // target's parent doesn't exist
+        give_up_modify_access(lca);
+        return ENOENT;
+    }
+
+    if (hmap_get(target_parent->children, new_name)) { // target already exists
+        give_up_modify_access(lca);
+        if (lca != target_parent)
+            give_up_modify_access(target_parent);
+        return EEXIST;
     }
 
     char source_name[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath_source = make_path_to_parent(source + common_length - 1, source_name);
     const char *source_subpath = initial_subpath_source;
 
-    if (!initial_subpath_source)
+    if (!initial_subpath_source) // source is the lca
         return EBUSY;
 
     Node *source_parent = modify_child(lca, source_subpath, true);
+    free(initial_subpath_source);
 
-    if (!source_parent){
-        free(initial_subpath_target);
-        free(initial_subpath_source);
+    if (!source_parent) { // source doesn't exist
+        give_up_modify_access(lca);
+        if (lca != target_parent)
+            give_up_modify_access(target_parent);
         return ENOENT;
     }
 
     Node *source_node = hmap_get(source_parent->children, source_name);
 
-    free(initial_subpath_target);
-    free(initial_subpath_source);
-
-    if (!source_node){
+    if (!source_node) { // source doesn't exist
         give_up_modify_access(source_parent);
+        if (lca != source_parent)
+            give_up_modify_access(lca);
+        if (lca != target_parent && source_parent != target_parent)
+            give_up_modify_access(target_parent);
         return ENOENT;
     }
 
+    // Waiting for processes in source's subtree to finish.
     bfs(source_node);
 
+    // Actually moving the subtree.
     hmap_remove(source_parent->children, source_name);
     hmap_insert(target_parent->children, new_name, source_node);
 
-    give_up_modify_access(lca);
+    give_up_modify_access(source_node);
+    give_up_modify_access(target_parent);
     if (lca != target_parent)
-        give_up_modify_access(target_parent);
-    if (target_parent != source_parent)
+        give_up_modify_access(lca);
+    if (target_parent != source_parent && lca != source_parent)
         give_up_modify_access(source_parent);
 
     return 0;
