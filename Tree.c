@@ -112,17 +112,6 @@ void give_up_read_access(Node *node) {
         syserr("unlock failed");
 }
 
-Node *traverse_down(Node *node, const char *component) {
-    Node *new_node = NULL;
-    get_read_access(node);
-
-    new_node = (Node *) hmap_get(node->children, component); // reading
-
-    give_up_read_access(node);
-
-    return new_node;
-}
-
 void get_modify_access(Node *node) {
     if (!node)
         return;
@@ -186,24 +175,26 @@ void get_move_access(Node *node) {
         syserr("unlock failed");
 }
 
-Node *modify_child(Tree *tree, const char *path) {
+Node *modify_child(Node *node, const char *path, const bool root_access) {
     char component[MAX_FOLDER_NAME_LENGTH + 1];
+    Node *root = node;
     const char *subpath = path;
     const char *new_subpath = subpath;
-    Node *node = tree->root;
     Node *new_node;
 
     subpath = split_path(subpath, component);
     if (!subpath) {
-        get_modify_access(node);
+        if (!root_access)
+            get_modify_access(node);
         return node;
     }
-
-    get_read_access(node);
+    if (!root_access)
+        get_read_access(node);
 
     do {
         new_node = (Node *) hmap_get(node->children, component);
-        give_up_read_access(node);
+        if (!root_access || node != root)
+            give_up_read_access(node);
 
         new_subpath = split_path(new_subpath, component);
         if (new_subpath) {
@@ -231,7 +222,7 @@ int tree_remove(Tree *tree, const char *path) {
     if (!subpath) // tried to remove the root
         return EBUSY;
 
-    Node *node = modify_child(tree, subpath);
+    Node *node = modify_child(tree->root, subpath, false);
 
     free(initial_subpath); //todo: trzeba jakoś zwolnić w przypadku błędów pthreads
     if (!node)
@@ -267,7 +258,7 @@ int tree_create(Tree *tree, const char *path) {
     if (!subpath)
         return EEXIST;
 
-    Node *node = modify_child(tree, subpath);
+    Node *node = modify_child(tree->root, subpath, false);
 
     free(initial_subpath); //todo: trzeba jakoś zwolnić w przypadku błędów pthreads
 
@@ -312,7 +303,7 @@ Tree *tree_new() {
 }
 
 // Creates a string consisting of comma-separated subfolders.
-// The calling thread shall have read access to the node's hashmap.
+// The calling thread shall have a read access to the node's hashmap.
 char *list_subfolders(Node *node) {
     size_t string_length = 0;
     size_t buffer_length = 1;
@@ -340,7 +331,7 @@ char *list_subfolders(Node *node) {
     return string;
 }
 
-// Returns a node representing a folder given by the path and acquires read access to it
+// Returns a node representing a folder given by the path and acquires a read access to it
 Node *read_child(Tree *tree, const char *path) {
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     const char *subpath = path;
@@ -408,18 +399,41 @@ void bfs(Node *node) {
     }
 }
 
+int path_lca(const char *path_a, const char *path_b, char **path) {
+    int last_dash_index = 0;
+    int index = 0;
+    while ((path_a + index) && (path_b + index)) {
+        if (path_a[index] != path_b[index])
+            break;
+        if (path_a[index] == '/')
+            last_dash_index = index;
+        index++;
+    }
+    char *common_path = (char *) malloc((last_dash_index + 2) * sizeof(char));
+    strncpy(common_path, path_a, last_dash_index + 1);
+    common_path[last_dash_index + 1] = '\0';
+    *path = common_path;
+    return last_dash_index + 1;
+}
+
 int tree_move(Tree* tree, const char* source, const char* target) {
     if (!is_path_valid(source) || !is_path_valid(target))
         return EINVAL;
 
-    if (is_subfolder(source, target))
-        return 69; //todo
+    if (is_subfolder(source, target)) //todo
+        return 69;
+
+    char *common_path;
+    int common_length = path_lca(source, target, &common_path);
+    Node* lca = modify_child(tree->root, common_path, false);
+    // teraz żaden nowy move nie wejdzie nam do wierzchołka
+    free(common_path);
 
     char new_name[MAX_FOLDER_NAME_LENGTH + 1];
-    char *initial_subpath_target = make_path_to_parent(target, new_name);
+    char *initial_subpath_target = make_path_to_parent(target + common_length - 1, new_name);
     const char *target_subpath = initial_subpath_target;
 
-    Node *target_parent = modify_child(tree, target_subpath);
+    Node *target_parent = modify_child(lca, target_subpath, true);
 
     int error;
     if ((error = check_target(target_parent, new_name)) != 0) {
@@ -429,17 +443,14 @@ int tree_move(Tree* tree, const char* source, const char* target) {
         return error;
     }
 
-//    // We might wait until source can be detached, so we cannot block processes working on target
-//    give_up_read_access(target_parent);
-
     char source_name[MAX_FOLDER_NAME_LENGTH + 1];
-    char *initial_subpath_source = make_path_to_parent(source, source_name);
+    char *initial_subpath_source = make_path_to_parent(source + common_length - 1, source_name);
     const char *source_subpath = initial_subpath_source;
 
     if (!initial_subpath_source)
         return EBUSY;
 
-    Node *source_parent = modify_child(tree, source_subpath);
+    Node *source_parent = modify_child(lca, source_subpath, true);
 
     if (!source_parent){
         free(initial_subpath_target);
@@ -461,7 +472,12 @@ int tree_move(Tree* tree, const char* source, const char* target) {
 
     hmap_remove(source_parent->children, source_name);
     hmap_insert(target_parent->children, new_name, source_node);
-    give_up_modify_access(target_parent);
-    give_up_modify_access(source_parent);
+
+    give_up_modify_access(lca);
+    if (lca != target_parent)
+        give_up_modify_access(target_parent);
+    if (target_parent != source_parent)
+        give_up_modify_access(source_parent);
+
     return 0;
 }
