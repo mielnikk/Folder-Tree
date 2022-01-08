@@ -179,7 +179,6 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     Node *root = node;
     const char *subpath = path;
-    const char *new_subpath = subpath;
     Node *new_node;
 
     subpath = split_path(subpath, component);
@@ -196,8 +195,8 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
         if (!root_access || node != root)
             give_up_read_access(node);
 
-        new_subpath = split_path(new_subpath, component);
-        if (new_subpath) {
+        subpath = split_path(subpath, component);
+        if (subpath) {
             get_read_access(new_node);
         }
         else {
@@ -205,7 +204,7 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
         }
         node = new_node;
 
-    } while (node && new_subpath);
+    } while (node && subpath);
 
     return node;
 }
@@ -250,7 +249,6 @@ int tree_create(Tree *tree, const char *path) {
     if (!is_path_valid(path))
         return EINVAL;
 
-    char component[MAX_FOLDER_NAME_LENGTH + 1];
     char last_component[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath = make_path_to_parent(path, last_component);
     const char *subpath = initial_subpath;
