@@ -8,7 +8,7 @@
 #include "path_utils.h"
 #include "err.h"
 
-#define MODIFIER_ACCESS -1
+#define WRITE_ACCESS -1
 
 typedef struct Node Node;
 
@@ -17,11 +17,11 @@ struct Node {
 
     pthread_mutex_t mutex;
     pthread_cond_t read_cond; // readers waiting
-    pthread_cond_t modify_cond; // writers waiting
+    pthread_cond_t write_cond; // writers waiting
     int readers_count;
-    int modifiers_count;
+    int writers_count;
 
-    int modifiers_waiting;
+    int writers_waiting;
     int readers_waiting;
 
     int change;
@@ -40,7 +40,7 @@ void delete_node(Node *node) {
         syserr("mutex destroy failed");
     if (pthread_cond_destroy(&node->read_cond) != 0)
         syserr("read cond destroy failed");
-    if (pthread_cond_destroy(&node->modify_cond) != 0)
+    if (pthread_cond_destroy(&node->write_cond) != 0)
         syserr("modify cond destroy failed");
 
     hmap_free(node->children);
@@ -54,15 +54,15 @@ Node *new_node() {
         syserr("mutex init failed");
     if (pthread_cond_init(&node->read_cond, 0) != 0)
         syserr("read cond init failed");
-    if (pthread_cond_init(&node->modify_cond, 0) != 0)
+    if (pthread_cond_init(&node->write_cond, 0) != 0)
         syserr("modify cond init failed");
     if (pthread_cond_init(&node->move_cond, 0) != 0)
         syserr("move cond init failed");
 
     node->change = 0;
-    node->modifiers_waiting = 0;
+    node->writers_waiting = 0;
     node->readers_waiting = 0;
-    node->modifiers_count = 0;
+    node->writers_count = 0;
     node->readers_count = 0;
     node->children = hmap_new();
 
@@ -77,7 +77,7 @@ void get_read_access(Node *node) {
         syserr("lock failed");
 
     node->readers_waiting++;
-    while (node->readers_waiting + node->modifiers_waiting > 1 && node->change <= 0) {
+    while (node->readers_waiting + node->writers_waiting > 1 && node->change <= 0) {
         if (pthread_cond_wait(&node->read_cond, &node->mutex) != 0)
             syserr("read cond wait failed");
     }
@@ -101,12 +101,12 @@ void give_up_read_access(Node *node) {
         syserr("mutex lock failed");
 
     node->readers_count--;
-    if (node->readers_count == 0 && node->modifiers_waiting > 0) {
-        node->change = MODIFIER_ACCESS;
-        if (pthread_cond_signal(&node->modify_cond) != 0)
+    if (node->readers_count == 0 && node->writers_waiting > 0) {
+        node->change = WRITE_ACCESS;
+        if (pthread_cond_signal(&node->write_cond) != 0)
             syserr("modify cond wait failed");
     }
-    else if (node->readers_count == 0 && node->modifiers_waiting == 0) {
+    else if (node->readers_count == 0 && node->writers_waiting == 0) {
         if (pthread_cond_signal(&node->move_cond) != 0)
             syserr("move cond wait failed");
     }
@@ -122,35 +122,35 @@ void get_modify_access(Node *node) {
     if (pthread_mutex_lock(&node->mutex) != 0)
         syserr("lock failed");
 
-    node->modifiers_waiting++;
-    while (node->modifiers_count + node->readers_count > 1 && node->change != MODIFIER_ACCESS) {
-        if (pthread_cond_wait(&node->modify_cond, &node->mutex) != 0)
+    node->writers_waiting++;
+    while (node->writers_count + node->readers_count > 0 && node->change != WRITE_ACCESS) {
+        if (pthread_cond_wait(&node->write_cond, &node->mutex) != 0)
             syserr("modify cond wait failed");
     }
-    node->modifiers_waiting--;
+    node->writers_waiting--;
 
     node->change = 0;
-    node->modifiers_count++;
+    node->writers_count++;
 
     if (pthread_mutex_unlock(&node->mutex) != 0)
         syserr("unlock failed");
 }
 
-void give_up_modify_access(Node *node) {
+void give_up_write_access(Node *node) {
     if (pthread_mutex_lock(&node->mutex) != 0)
         syserr("lock failed");
 
-    node->modifiers_count--;
+    node->writers_count--;
 
     if (node->readers_waiting > 0) {
         node->change = node->readers_waiting;
         if (pthread_cond_signal(&node->read_cond) != 0)
             syserr("read cond signal failed");
     }
-    else if (node->modifiers_waiting > 0) {
-        node->change = MODIFIER_ACCESS;
-        if (pthread_cond_signal(&node->modify_cond) != 0)
-            syserr("modify cond signal failed");
+    else if (node->writers_waiting > 0) {
+        node->change = WRITE_ACCESS;
+        if (pthread_cond_signal(&node->write_cond) != 0)
+            syserr("write cond signal failed");
     }
     else {
         if (pthread_cond_signal(&node->move_cond) != 0)
@@ -165,12 +165,12 @@ void get_move_access(Node *node) {
     if (pthread_mutex_lock(&node->mutex) != 0)
         syserr("lock failed");
 
-    while (node->modifiers_waiting + node->modifiers_count
+    while (node->writers_waiting + node->writers_count
            + node->readers_waiting + node->readers_count > 0) {
         if (pthread_cond_wait(&node->move_cond, &node->mutex) != 0)
             syserr("modify cond wait failed");
     }
-    node->change = MODIFIER_ACCESS;
+    node->change = WRITE_ACCESS;
 
     if (pthread_mutex_unlock(&node->mutex) != 0)
         syserr("unlock failed");
@@ -182,9 +182,9 @@ void give_up_move_access(Node *node) {
         if (pthread_cond_signal(&node->read_cond) != 0)
             syserr("read cond signal failed");
     }
-    else if (node->modifiers_waiting > 0) {
-        node->change = MODIFIER_ACCESS;
-        if (pthread_cond_signal(&node->modify_cond) != 0)
+    else if (node->writers_waiting > 0) {
+        node->change = WRITE_ACCESS;
+        if (pthread_cond_signal(&node->write_cond) != 0)
             syserr("modify cond signal failed");
     }
 
@@ -246,21 +246,22 @@ int tree_remove(Tree *tree, const char *path) {
     if (!node)
         return ENOENT;
 
-    Node *child = (Node *) hmap_get(node->children, last_component);
+    void *child = hmap_get(node->children, last_component);
 
     if (!child) {
-        give_up_modify_access(node);
+        give_up_write_access(node);
         return ENOENT;
     }
 
-    if (hmap_size(child->children) > 0) {
-        give_up_modify_access(node);
+    if (hmap_size(((Node *) child)->children) > 0) {
+        give_up_write_access(node);
         return ENOTEMPTY;
     }
 
-    hmap_remove(node->children, last_component);
+    get_move_access(child);
+    assert(hmap_remove(node->children, last_component));
     delete_node(child);
-    give_up_modify_access(node); // todo: chyba trzeba zaczekać, aż procesy w dziecku się skończą
+    give_up_write_access(node);
     return 0;
 }
 
@@ -285,14 +286,14 @@ int tree_create(Tree *tree, const char *path) {
     Node *child = (Node *) hmap_get(node->children, last_component);
 
     if (child) {
-        give_up_modify_access(node);
+        give_up_write_access(node);
         return EEXIST;
     }
 
     Node *new_folder = new_node();
-    hmap_insert(node->children, last_component, new_folder);
+    assert(hmap_insert(node->children, last_component, new_folder));
 
-    give_up_modify_access(node);
+    give_up_write_access(node);
     return 0;
 }
 
@@ -453,7 +454,7 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     const char *target_subpath = initial_subpath_target;
 
     if (!initial_subpath_target) { // target is the lca
-        give_up_modify_access(lca);
+        give_up_write_access(lca);
         return EEXIST;
     }
 
@@ -461,14 +462,14 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     free(initial_subpath_target);
 
     if (!target_parent) { // target's parent doesn't exist
-        give_up_modify_access(lca);
+        give_up_write_access(lca);
         return ENOENT;
     }
 
     if (hmap_get(target_parent->children, new_name)) { // target already exists
-        give_up_modify_access(lca);
+        give_up_write_access(lca);
         if (lca != target_parent)
-            give_up_modify_access(target_parent);
+            give_up_write_access(target_parent);
         return EEXIST;
     }
 
@@ -483,19 +484,19 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     free(initial_subpath_source);
 
     if (lca != target_parent && lca != source_parent)
-        give_up_modify_access(lca);
+        give_up_write_access(lca);
 
     if (!source_parent) { // source doesn't exist
-        give_up_modify_access(target_parent);
+        give_up_write_access(target_parent);
         return ENOENT;
     }
 
     Node *source_node = hmap_get(source_parent->children, source_name);
 
     if (!source_node) { // source doesn't exist
-        give_up_modify_access(source_parent);
+        give_up_write_access(source_parent);
         if (source_parent != target_parent)
-            give_up_modify_access(target_parent);
+            give_up_write_access(target_parent);
         return ENOENT;
     }
 
@@ -506,10 +507,10 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     hmap_remove(source_parent->children, source_name);
     hmap_insert(target_parent->children, new_name, source_node);
 
-    give_up_modify_access(source_node);
-    give_up_modify_access(target_parent);
+    give_up_write_access(source_node);
+    give_up_write_access(target_parent);
     if (target_parent != source_parent)
-        give_up_modify_access(source_parent);
+        give_up_write_access(source_parent);
 
     return 0;
 }
