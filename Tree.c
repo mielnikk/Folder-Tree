@@ -77,16 +77,21 @@ void get_read_access(Node *node) {
         syserr("lock failed");
 
     node->readers_waiting++;
-    while (node->readers_waiting + node->writers_waiting > 1 && node->change <= 0) {
+    assert(node->readers_waiting >= 0);
+    while (node->writers_count + node->writers_waiting > 0 && node->change <= 0) {
         if (pthread_cond_wait(&node->read_cond, &node->mutex) != 0)
             syserr("read cond wait failed");
     }
     node->readers_waiting--;
-
+    assert(node->readers_waiting >= 0);
     if (node->change > 0)
         node->change--;
 
     node->readers_count++;
+
+    assert(node->writers_count == 0);
+    assert(node->change >= 0);
+    assert(node->readers_count > 0);
 
     if (node->change > 0)
         if (pthread_cond_signal(&node->read_cond) != 0)
@@ -101,6 +106,8 @@ void give_up_read_access(Node *node) {
         syserr("mutex lock failed");
 
     node->readers_count--;
+    assert(node->readers_count >= 0);
+    assert(node->writers_count == 0);
     if (node->readers_count == 0 && node->writers_waiting > 0) {
         node->change = WRITE_ACCESS;
         if (pthread_cond_signal(&node->write_cond) != 0)
@@ -115,12 +122,13 @@ void give_up_read_access(Node *node) {
         syserr("unlock failed");
 }
 
-void get_modify_access(Node *node) {
+void get_write_access(Node *node) {
     if (!node)
         return;
 
     if (pthread_mutex_lock(&node->mutex) != 0)
         syserr("lock failed");
+
 
     node->writers_waiting++;
     while (node->writers_count + node->readers_count > 0 && node->change != WRITE_ACCESS) {
@@ -128,6 +136,9 @@ void get_modify_access(Node *node) {
             syserr("modify cond wait failed");
     }
     node->writers_waiting--;
+
+    assert(node->readers_count == 0);
+    assert(node->writers_count == 0);
 
     node->change = 0;
     node->writers_count++;
@@ -141,7 +152,7 @@ void give_up_write_access(Node *node) {
         syserr("lock failed");
 
     node->writers_count--;
-
+    assert(node->writers_count == 0);
     if (node->readers_waiting > 0) {
         node->change = node->readers_waiting;
         if (pthread_cond_signal(&node->read_cond) != 0)
@@ -170,7 +181,7 @@ void get_move_access(Node *node) {
         if (pthread_cond_wait(&node->move_cond, &node->mutex) != 0)
             syserr("modify cond wait failed");
     }
-    node->change = WRITE_ACCESS;
+    node->change = 0;
 
     if (pthread_mutex_unlock(&node->mutex) != 0)
         syserr("unlock failed");
@@ -204,7 +215,7 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
     subpath = split_path(subpath, component);
     if (!subpath) {
         if (!root_access)
-            get_modify_access(node);
+            get_write_access(node);
         return node;
     }
     if (!root_access)
@@ -215,16 +226,39 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
         if (!root_access || node != root)
             give_up_read_access(node);
 
+        if (!new_node)
+            return new_node;
+
         subpath = split_path(subpath, component);
         if (subpath) {
             get_read_access(new_node);
         }
         else {
-            get_modify_access(new_node);
+            get_write_access(new_node);
         }
         node = new_node;
 
     } while (node && subpath);
+
+    return node;
+}
+
+/* Returns a node represented by the path and acquires a read access to it. */
+Node *read_child(Tree *tree, const char *path) {
+    char component[MAX_FOLDER_NAME_LENGTH + 1];
+    const char *subpath = path;
+    Node *node = tree->root;
+    Node *new_node;
+
+    get_read_access(node);
+
+    while (node && (subpath = split_path(subpath, component))) {
+        new_node = (Node *) hmap_get(node->children, component);
+        if (new_node)
+            get_read_access(new_node);
+        give_up_read_access(node);
+        node = new_node;
+    }
 
     return node;
 }
@@ -297,6 +331,7 @@ int tree_create(Tree *tree, const char *path) {
     return 0;
 }
 
+
 void remove_nodes(Node *node) {
     HashMapIterator hm = hmap_iterator(node->children);
     const char *key;
@@ -307,7 +342,6 @@ void remove_nodes(Node *node) {
 
     delete_node(node);
 }
-
 
 void tree_free(Tree *tree) {
     remove_nodes(tree->root);
@@ -347,26 +381,6 @@ char *list_subfolders(Node *node) {
 
     string[string_length] = '\0';
     return string;
-}
-
-/* Returns a node represented by the path and acquires a read access to it. */
-Node *read_child(Tree *tree, const char *path) {
-    char component[MAX_FOLDER_NAME_LENGTH + 1];
-    const char *subpath = path;
-    Node *node = tree->root;
-    Node *new_node;
-
-    get_read_access(node);
-
-    while (node && (subpath = split_path(subpath, component))) {
-        new_node = (Node *) hmap_get(node->children, component);
-        if (new_node)
-            get_read_access(node);
-        give_up_read_access(node);
-        node = new_node;
-    }
-
-    return node;
 }
 
 char *tree_list(Tree *tree, const char *path) {
@@ -507,7 +521,7 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     hmap_remove(source_parent->children, source_name);
     hmap_insert(target_parent->children, new_name, source_node);
 
-    give_up_write_access(source_node);
+//    give_up_write_access(source_node);
     give_up_write_access(target_parent);
     if (target_parent != source_parent)
         give_up_write_access(source_parent);
