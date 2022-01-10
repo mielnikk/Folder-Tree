@@ -16,17 +16,22 @@ struct Node {
     HashMap *children;
 
     pthread_mutex_t mutex;
-    pthread_cond_t read_cond; // readers waiting
-    pthread_cond_t write_cond; // writers waiting
+    pthread_cond_t read_cond; /* condition for readers to wait on */
+    pthread_cond_t write_cond; /* condition for writers to wait on */
     int readers_count;
     int writers_count;
 
     int writers_waiting;
     int readers_waiting;
 
+    /* Helps to indicate whether a woken process was actually signaled.
+     * If set to WRITE_ACCESS, indicates that a signaled writer may access the critical section.
+     * If set to 0, any process can access the critical section if there are no other processes that
+     * forbid it.
+     * If the value is >0, a signaled reader may access the critical section. */
     int change;
 
-    // a process waiting on this condition is going to be the last process to access the node
+    /* a process waiting on this condition is going to be the last process to access the node */
     pthread_cond_t move_cond;
 };
 
@@ -47,6 +52,7 @@ void delete_node(Node *node) {
     free(node);
 }
 
+/* Creates a new node and initializes its attributes. */
 Node *new_node() {
     Node *node = (Node *) malloc(sizeof(Node));
 
@@ -69,6 +75,7 @@ Node *new_node() {
     return node;
 }
 
+/* Acquires read access to `node`. */
 void get_read_access(Node *node) {
     if (!node)
         return;
@@ -101,6 +108,7 @@ void get_read_access(Node *node) {
         syserr("unlock failed");
 }
 
+/* Releases read access to `node`. */
 void give_up_read_access(Node *node) {
     if (pthread_mutex_lock(&node->mutex) != 0)
         syserr("mutex lock failed");
@@ -122,6 +130,7 @@ void give_up_read_access(Node *node) {
         syserr("unlock failed");
 }
 
+/* Acquires write access to `node` */
 void get_write_access(Node *node) {
     if (!node)
         return;
@@ -147,6 +156,7 @@ void get_write_access(Node *node) {
         syserr("unlock failed");
 }
 
+/* Releases write access to `node`. */
 void give_up_write_access(Node *node) {
     if (pthread_mutex_lock(&node->mutex) != 0)
         syserr("lock failed");
@@ -172,6 +182,10 @@ void give_up_write_access(Node *node) {
         syserr("unlock failed");
 }
 
+/* Acquires write access to `node`. If any other processes are waiting or working,
+ * lets them access `node` first.
+ * To avoid starvation, a write lock on `node`'s parent is needed, as it blocks
+ * new incoming processes. */
 void get_move_access(Node *node) {
     if (pthread_mutex_lock(&node->mutex) != 0)
         syserr("lock failed");
@@ -187,28 +201,19 @@ void get_move_access(Node *node) {
         syserr("unlock failed");
 }
 
-void give_up_move_access(Node *node) {
-    if (node->readers_waiting > 0) {
-        node->change = node->readers_waiting;
-        if (pthread_cond_signal(&node->read_cond) != 0)
-            syserr("read cond signal failed");
-    }
-    else if (node->writers_waiting > 0) {
-        node->change = WRITE_ACCESS;
-        if (pthread_cond_signal(&node->write_cond) != 0)
-            syserr("modify cond signal failed");
-    }
-
-    if (pthread_mutex_unlock(&node->mutex) != 0)
-        syserr("unlock failed");
-}
-
+/* Acquires write access to the folder indicated by the path.
+ * Args:
+ * - `node`: a node corresponding to the first folder in the path
+ * - `path`: a valid path
+ * - `root_access`: true if the calling proccess already has access to `node`
+ * If `root_access` is set to true, the function doesn't release access to `node`
+ * whilst traversing the tree. */
 Node *modify_child(Node *node, const char *path, const bool root_access) {
     if (!node)
         return NULL;
 
     char component[MAX_FOLDER_NAME_LENGTH + 1];
-    Node *root = node;
+    const Node *root = node;
     const char *subpath = path;
     Node *new_node;
 
@@ -230,17 +235,16 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
         }
 
         subpath = split_path(subpath, component);
-        if (subpath) {
+        if (subpath)
             get_read_access(new_node);
-        }
-        else {
+        else
             get_write_access(new_node);
-        }
+
         if (!root_access || node != root)
             give_up_read_access(node);
-        node = new_node;
 
-    } while (node && subpath);
+        node = new_node;
+    } while (subpath);
 
     return node;
 }
@@ -269,11 +273,12 @@ int tree_remove(Tree *tree, const char *path) {
     if (!is_path_valid(path))
         return EINVAL;
 
+    /* Searching for the parent folder and getting a write access to it. */
     char last_component[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath = make_path_to_parent(path, last_component);
     const char *subpath = initial_subpath;
 
-    if (!subpath) // tried to remove the root
+    if (!subpath) /* tried to remove the root */
         return EBUSY;
 
     Node *node = modify_child(tree->root, subpath, false);
@@ -282,6 +287,7 @@ int tree_remove(Tree *tree, const char *path) {
     if (!node)
         return ENOENT;
 
+    /* Making sure the folder we want to delete exists. */
     void *child = hmap_get(node->children, last_component);
 
     if (!child) {
@@ -289,12 +295,15 @@ int tree_remove(Tree *tree, const char *path) {
         return ENOENT;
     }
 
+    /* Making sure the folder is empty */
     if (hmap_size(((Node *) child)->children) > 0) {
         give_up_write_access(node);
         return ENOTEMPTY;
     }
-
+    /* Waiting for other processes in the folder to finish. */
     get_move_access(child);
+
+    /* Removing the folder and unlocking its parent. */
     assert(hmap_remove(node->children, last_component));
     delete_node(child);
     give_up_write_access(node);
@@ -305,6 +314,7 @@ int tree_create(Tree *tree, const char *path) {
     if (!is_path_valid(path))
         return EINVAL;
 
+    /* Searching for the parent folder and getting write access to it. */
     char last_component[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath = make_path_to_parent(path, last_component);
     const char *subpath = initial_subpath;
@@ -319,6 +329,7 @@ int tree_create(Tree *tree, const char *path) {
     if (!node)
         return ENOENT;
 
+    /* Making sure the folder we want to create doesn't already exist. */
     Node *child = (Node *) hmap_get(node->children, last_component);
 
     if (child) {
@@ -333,14 +344,14 @@ int tree_create(Tree *tree, const char *path) {
     return 0;
 }
 
-
+/* Removes `node` and its subtree.
+ * No other process is allowed to work in `node` or its subtree the moment this function is called. */
 void remove_nodes(Node *node) {
     HashMapIterator hm = hmap_iterator(node->children);
     const char *key;
     void *value;
-    while (hmap_next(node->children, &hm, &key, &value)) {
+    while (hmap_next(node->children, &hm, &key, &value))
         remove_nodes((Node *) value);
-    }
 
     delete_node(node);
 }
@@ -454,22 +465,24 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     if (strcmp(source, "/") == 0)
         return EBUSY;
 
-    if (is_subfolder(source, target)) //todo
+    if (is_subfolder(source, target)) /* trying to move source to its subtree */
         return -1;
 
+    /* Locking the lca of source and target to search for source and target
+     * and to not end in deadlock with other process calling `tree_move`. */
     char *common_path;
     size_t common_length = path_lca(source, target, &common_path);
     Node *lca = modify_child(tree->root, common_path, false);
-    // teraz żaden nowy move nie wejdzie nam do wierzchołka
     free(common_path);
     if (!lca)
         return ENOENT;
 
+    /* Trying to find and write-lock target's parent. */
     char new_name[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath_target = make_path_to_parent(target + common_length - 1, new_name);
     const char *target_subpath = initial_subpath_target;
 
-    if (!initial_subpath_target) { // target is the lca
+    if (!initial_subpath_target) { /* target is the lca */
         give_up_write_access(lca);
         return EEXIST;
     }
@@ -477,53 +490,57 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     Node *target_parent = modify_child(lca, target_subpath, true);
     free(initial_subpath_target);
 
-    if (!target_parent) { // target's parent doesn't exist
+    if (!target_parent) { /* target's parent doesn't exist */
         give_up_write_access(lca);
         return ENOENT;
     }
 
-    if (hmap_get(target_parent->children, new_name)) { // target already exists
+    if (hmap_get(target_parent->children, new_name)) { /* target already exists */
         give_up_write_access(lca);
         if (lca != target_parent)
             give_up_write_access(target_parent);
         return EEXIST;
     }
 
+    /* Trying to find and lock source's parent, as we are planning to modify its hashmap. */
     char source_name[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath_source = make_path_to_parent(source + common_length - 1, source_name);
     const char *source_subpath = initial_subpath_source;
 
-    if (!initial_subpath_source) // source is the lca
+    if (!initial_subpath_source) /* source is the lca */
         return EBUSY;
 
     Node *source_parent = modify_child(lca, source_subpath, true);
     free(initial_subpath_source);
 
+    /* Source's parent and target's parent have been locked, so we're unlocking the lca. */
     if (lca != target_parent && lca != source_parent)
         give_up_write_access(lca);
 
-    if (!source_parent) { // source doesn't exist
+    if (!source_parent) { /* source doesn't exist because its parent doesn't */
         give_up_write_access(target_parent);
         return ENOENT;
     }
 
     Node *source_node = hmap_get(source_parent->children, source_name);
 
-    if (!source_node) { // source doesn't exist
+    if (!source_node) { /* source doesn't exist */
         give_up_write_access(source_parent);
         if (source_parent != target_parent)
             give_up_write_access(target_parent);
         return ENOENT;
     }
 
-    // Waiting for processes in source's subtree to finish.
+    /* Waiting for processes in source's subtree to finish. */
     bfs(source_node);
 
-    // Actually moving the subtree.
+    /* Actually moving the subtree. */
     hmap_remove(source_parent->children, source_name);
     hmap_insert(target_parent->children, new_name, source_node);
 
-//    give_up_write_access(source_node);
+    /* Unlocking both parents. We don't need to unlock the moved node,
+     * since no other process is working on its subtree and any new incoming process
+     * may get access to it. */
     give_up_write_access(target_parent);
     if (target_parent != source_parent)
         give_up_write_access(source_parent);
