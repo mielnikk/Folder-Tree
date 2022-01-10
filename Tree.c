@@ -223,11 +223,11 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
 
     do {
         new_node = (Node *) hmap_get(node->children, component);
-        if (!root_access || node != root)
-            give_up_read_access(node);
-
-        if (!new_node)
+        if (!new_node) {
+            if (!root_access || node != root)
+                give_up_read_access(node);
             return new_node;
+        }
 
         subpath = split_path(subpath, component);
         if (subpath) {
@@ -236,6 +236,8 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
         else {
             get_write_access(new_node);
         }
+        if (!root_access || node != root)
+            give_up_read_access(node);
         node = new_node;
 
     } while (node && subpath);
