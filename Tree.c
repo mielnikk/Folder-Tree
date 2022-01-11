@@ -295,13 +295,14 @@ int tree_remove(Tree *tree, const char *path) {
         return ENOENT;
     }
 
+    /* Waiting for other processes in the folder to finish. */
+    get_move_access(child);
+
     /* Making sure the folder is empty */
     if (hmap_size(((Node *) child)->children) > 0) {
         give_up_write_access(node);
         return ENOTEMPTY;
     }
-    /* Waiting for other processes in the folder to finish. */
-    get_move_access(child);
 
     /* Removing the folder and unlocking its parent. */
     assert(hmap_remove(node->children, last_component));
