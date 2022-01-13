@@ -272,13 +272,13 @@ bool is_subfolder(const char *a, const char *b) {
 }
 
 /* Ensures there are no running processes in tree rooted in node. */
-void bfs(Node *node) {
+void subtree_wait(Node *node) {
     get_move_access(node);
     HashMapIterator it = hmap_iterator(node->children);
     const char *key;
     void *value;
     while (hmap_next(node->children, &it, &key, &value)) {
-        bfs((Node *) value);
+        subtree_wait((Node *) value);
     }
 }
 
@@ -380,7 +380,7 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     }
 
     /* Waiting for processes in source's subtree to finish. */
-    bfs(source_node);
+    subtree_wait(source_node);
 
     /* Actually moving the subtree. */
     hmap_remove(source_parent->children, source_name);
