@@ -99,6 +99,7 @@ char* make_map_contents_string(HashMap* map)
         // Note we can't just return "", as it can't be free'd.
         char* result = malloc(1);
         *result = '\0';
+        free(keys);
         return result;
     }
 

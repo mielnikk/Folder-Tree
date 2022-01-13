@@ -325,7 +325,7 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     char source_name[MAX_FOLDER_NAME_LENGTH + 1];
     char *initial_subpath_source = make_path_to_parent(source + common_length - 1, source_name);
     const char *source_subpath = initial_subpath_source;
-    
+
     Node *source_parent = write_folder(lca, source_subpath, true);
     free(initial_subpath_source);
 
