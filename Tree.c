@@ -74,19 +74,21 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
         get_read_access(node);
 
     do {
+        /* Searches for next node in the hashmap of the current one. */
         new_node = (Node *) hmap_get(node->children, component);
         if (!new_node) {
             if (!root_access || node != root)
                 give_up_read_access(node);
             return new_node;
         }
-
+        /* Checks if the next node is going to be the last and gets access to it. */
         subpath = split_path(subpath, component);
         if (subpath)
             get_read_access(new_node);
         else
             get_write_access(new_node);
 
+        /* Gives up access to the current node. */
         if (!root_access || node != root)
             give_up_read_access(node);
 
