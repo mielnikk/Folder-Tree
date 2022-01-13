@@ -217,46 +217,16 @@ Tree *tree_new() {
     return tree;
 }
 
-/* Creates a string consisting of comma-separated subfolders.
- * The calling thread shall have a read access to the node. */
-char *list_subfolders(Node *node) {
-    size_t string_length = 0;
-    size_t buffer_length = 1;
-    char *string = (char *) malloc(sizeof(char));
-
-    HashMapIterator it = hmap_iterator(node->children);
-    const char *key;
-    void *value;
-
-    while (hmap_next(node->children, &it, &key, &value)) {
-        size_t key_length = strlen(key);
-        if (string_length + key_length + 1 > buffer_length) {
-            buffer_length += MAX_FOLDER_NAME_LENGTH + 1;
-            string = (char *) realloc(string, buffer_length * sizeof(char));
-        }
-
-        if (string_length > 0)
-            string[string_length++] = ',';
-
-        strcpy(string + string_length, key);
-        string_length += key_length;
-    }
-
-    string[string_length] = '\0';
-    return string;
-}
-
 char *tree_list(Tree *tree, const char *path) {
     if (!is_path_valid(path))
         return NULL;
 
     Node *node = read_folder(tree, path);
 
-    if (!node) {
+    if (!node)
         return NULL;
-    }
 
-    char *string = list_subfolders(node);
+    char *string = make_map_contents_string(node->children);
     give_up_read_access(node);
 
     return string;
@@ -279,9 +249,8 @@ void subtree_wait(Node *node) {
     HashMapIterator it = hmap_iterator(node->children);
     const char *key;
     void *value;
-    while (hmap_next(node->children, &it, &key, &value)) {
+    while (hmap_next(node->children, &it, &key, &value))
         subtree_wait((Node *) value);
-    }
 }
 
 /* Finds the last common folder of two given paths.
