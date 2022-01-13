@@ -55,7 +55,7 @@ Node *new_node() {
  * - `root_access`: true if the calling proccess already has access to `node`
  * If `root_access` is set to true, the function doesn't release access to `node`
  * whilst traversing the tree. */
-Node *modify_child(Node *node, const char *path, const bool root_access) {
+Node *write_folder(Node *node, const char *path, const bool root_access) {
     if (!node)
         return NULL;
 
@@ -99,7 +99,7 @@ Node *modify_child(Node *node, const char *path, const bool root_access) {
 }
 
 /* Returns a node represented by the path and acquires a read access to it. */
-Node *read_child(Tree *tree, const char *path) {
+Node *read_folder(Tree *tree, const char *path) {
     char component[MAX_FOLDER_NAME_LENGTH + 1];
     const char *subpath = path;
     Node *node = tree->root;
@@ -130,7 +130,7 @@ int tree_remove(Tree *tree, const char *path) {
     if (!subpath) /* tried to remove the root */
         return EBUSY;
 
-    Node *node = modify_child(tree->root, subpath, false);
+    Node *node = write_folder(tree->root, subpath, false);
 
     free(initial_subpath);
     if (!node)
@@ -172,7 +172,7 @@ int tree_create(Tree *tree, const char *path) {
     if (!subpath)
         return EEXIST;
 
-    Node *node = modify_child(tree->root, subpath, false);
+    Node *node = write_folder(tree->root, subpath, false);
 
     free(initial_subpath);
 
@@ -250,7 +250,7 @@ char *tree_list(Tree *tree, const char *path) {
     if (!is_path_valid(path))
         return NULL;
 
-    Node *node = read_child(tree, path);
+    Node *node = read_folder(tree, path);
 
     if (!node) {
         return NULL;
@@ -322,7 +322,7 @@ int tree_move(Tree *tree, const char *source, const char *target) {
      * and to not end in deadlock with other process calling `tree_move`. */
     char *common_path;
     size_t common_length = path_lca(source, target, &common_path);
-    Node *lca = modify_child(tree->root, common_path, false);
+    Node *lca = write_folder(tree->root, common_path, false);
     free(common_path);
     if (!lca)
         return ENOENT;
@@ -337,7 +337,7 @@ int tree_move(Tree *tree, const char *source, const char *target) {
         return EEXIST;
     }
 
-    Node *target_parent = modify_child(lca, target_subpath, true);
+    Node *target_parent = write_folder(lca, target_subpath, true);
     free(initial_subpath_target);
 
     if (!target_parent) { /* target's parent doesn't exist */
@@ -360,7 +360,7 @@ int tree_move(Tree *tree, const char *source, const char *target) {
     if (!initial_subpath_source) /* source is the lca */
         return EBUSY;
 
-    Node *source_parent = modify_child(lca, source_subpath, true);
+    Node *source_parent = write_folder(lca, source_subpath, true);
     free(initial_subpath_source);
 
     /* Source's parent and target's parent have been locked, so we're unlocking the lca. */
