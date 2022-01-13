@@ -3,7 +3,6 @@
 #include <pthread.h>
 #include <string.h>
 #include <malloc.h>
-#include <assert.h>
 #include "HashMap.h"
 #include "path_utils.h"
 #include "err.h"
@@ -153,7 +152,7 @@ int tree_remove(Tree *tree, const char *path) {
     }
 
     /* Removing the folder and unlocking its parent. */
-    assert(hmap_remove(node->children, last_component));
+    hmap_remove(node->children, last_component);
     delete_node(child);
     give_up_write_access(node);
     return 0;
@@ -187,7 +186,7 @@ int tree_create(Tree *tree, const char *path) {
     }
 
     Node *new_folder = new_node();
-    assert(hmap_insert(node->children, last_component, new_folder));
+    hmap_insert(node->children, last_component, new_folder);
 
     give_up_write_access(node);
     return 0;
